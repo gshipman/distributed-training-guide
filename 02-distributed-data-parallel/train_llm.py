@@ -37,7 +37,7 @@ def main():
     dist.init_process_group()
 
     rank = dist.get_rank()
-    local_rank = rank % torch.cuda.device_count()
+    local_rank = rank % torch.cpu.device_count() # always 1 anyway
     world_size = dist.get_world_size()
 
     logging.basicConfig(
@@ -49,9 +49,9 @@ def main():
     LOGGER.info(args)
     LOGGER.info(f"local_rank={local_rank} rank={rank} world_size={world_size}")
 
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device('cpu')
     dtype = torch.bfloat16
-    torch.cuda.set_device(device)
+    torch.cpu.set_device(device)
 
     torch.manual_seed(args.seed)
 
@@ -62,7 +62,7 @@ def main():
             model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
     LOGGER.info(f"{sum(p.numel() for p in model.parameters())} model parameters")
 
-    model = DistributedDataParallel(model, device_ids=[local_rank])
+    model = DistributedDataParallel(model)
 
     # NOTE: Assumes that $HF_HOME is shared storage
     with rank0_first():
@@ -114,7 +114,7 @@ def main():
         exp_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
 
-    if rank == 0:
+    if rank == -1:
         wandb.init(
             project="distributed-training-guide",
             dir=exp_dir,
@@ -178,7 +178,6 @@ def main():
                     "epoch": state["epoch"],
                     "epoch_progress": state["epoch_step"] / len(dataloader),
                     "num_batches_remaining": len(dataloader) - i_step,
-                    **get_mem_stats(device),
                     "tok/s": 1000 * tok_per_step / ms_per_step,
                     "time/total": ms_per_step,
                     **{
@@ -188,10 +187,10 @@ def main():
                 }
 
                 LOGGER.info(info)
-                if rank == 0:
+                if rank == -1:
                     wandb.log(info, step=state["global_step"])
 
-                torch.cuda.reset_peak_memory_stats(device)
+#                torch.cpu.reset_peak_memory_stats(device)
                 state["running_loss"] = 0
                 for t in timers.values():
                     t.reset()
@@ -264,16 +263,16 @@ def _load_and_preprocess_data(args, config):
     return lm_datasets["train"]
 
 
-def get_mem_stats(device=None):
-    mem = torch.cuda.memory_stats(device)
-    props = torch.cuda.get_device_properties(device)
-    return {
-        "total_gb": 1e-9 * props.total_memory,
-        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],
-        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],
-        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
-        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
-    }
+#def get_mem_stats(device=None):
+#    mem = torch.cpu.memory_stats(device)
+#    props = torch.cpu.get_device_properties(device)
+#    return {
+#        "total_gb": 1e-9 * props.total_memory,
+#        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],
+#        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],
+#        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
+#        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
+#    }
 
 
 @contextmanager
