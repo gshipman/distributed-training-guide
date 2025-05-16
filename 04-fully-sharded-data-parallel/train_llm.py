@@ -16,7 +16,6 @@ from torch import distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel,
-    CPUOffload,
     ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
@@ -54,7 +53,7 @@ def main():
     dist.init_process_group()
 
     rank = dist.get_rank()
-    local_rank = rank % torch.cuda.device_count()
+    local_rank = 0 
     world_size = dist.get_world_size()
 
     logging.basicConfig(
@@ -66,9 +65,10 @@ def main():
     LOGGER.info(args)
     LOGGER.info(f"local_rank={local_rank} rank={rank} world size={world_size}")
 
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device("cpu")
+     
     dtype = torch.bfloat16
-    torch.cuda.set_device(device)
+    torch.cpu.set_device(device)
 
     torch.manual_seed(args.seed)
 
@@ -79,22 +79,16 @@ def main():
             model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
     LOGGER.info(f"{sum(p.numel() for p in model.parameters())} model parameters")
 
-    LOGGER.info(f"Before FSDP: {get_mem_stats(device)}")
+ #   wrap_policy = functools.partial(
+ #       size_based_auto_wrap_policy, min_num_params=int(args.numel_to_wrap)
+ #   )
 
-    wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=int(args.numel_to_wrap)
-    )
     model = FullyShardedDataParallel(
         model,
-        device_id=local_rank,
-        sync_module_states=True,
-        # NOTE: FULL_SHARD is equivalent to deepspeed ZeRO stage 3
-        auto_wrap_policy=wrap_policy,
+	device_id=torch.device("cpu"),
+        sync_module_states=False,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        cpu_offload=CPUOffload(offload_params=args.cpu_offload == "on"),
     )
-
-    LOGGER.info(f"After FSDP: {get_mem_stats(device)}")
 
     # NOTE: since this can download data, make sure to do the main process first
     # NOTE: This assumes that the data is on a **shared** network drive, accessible to all processes
@@ -119,7 +113,7 @@ def main():
     exp_dir: Path = Path(args.save_dir) / args.experiment_name
 
     # NOTE: full_state_dict=False means we will be saving sharded checkpoints.
-    ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=False)
 
     # attempt resume
     state = {
@@ -165,7 +159,7 @@ def main():
     (exp_dir / f"rank-{rank}").mkdir(parents=True, exist_ok=True)
     LOGGER.info(f"Worker saving to {exp_dir / f'rank-{rank}'}")
 
-    if rank == 0:
+    if rank == -1:
         wandb.init(
             project="distributed-training-guide",
             dir=exp_dir,
@@ -228,7 +222,6 @@ def main():
                     "epoch": state["epoch"],
                     "epoch_progress": state["epoch_step"] / len(dataloader),
                     "num_batches_remaining": len(dataloader) - i_step,
-                    **get_mem_stats(device),
                     "tok/s": 1000 * tok_per_step / ms_per_step,
                     "time/total": ms_per_step,
                     **{
@@ -238,10 +231,9 @@ def main():
                 }
 
                 LOGGER.info(info)
-                if rank == 0:
+                if rank == -1:
                     wandb.log(info, step=state["global_step"])
 
-                torch.cuda.reset_peak_memory_stats(device)
                 state["running_loss"] = 0
                 for t in timers.values():
                     t.reset()
@@ -320,17 +312,6 @@ def _load_and_preprocess_data(args, config):
 
     return lm_datasets["train"]
 
-
-def get_mem_stats(device=None):
-    mem = torch.cuda.memory_stats(device)
-    props = torch.cuda.get_device_properties(device)
-    return {
-        "total_gb": 1e-9 * props.total_memory,
-        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],
-        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],
-        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
-        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
-    }
 
 
 @contextmanager
